@@ -11,26 +11,66 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fortran packages (quadprog, rootSolve, muhaz, deSolve): LLVM flang chokes
+      # on host-CPU flags R passes it. Strip the incompatible ones. Harmless for
+      # C/C++/pure-R packages.
       - name: Create flang wrapper to filter incompatible flags
         run: |
           cp /opt/flang/host/bin/flang /opt/flang/host/bin/flang-orig
           printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    -fvisibility=*|-msse*|-mfpmath=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec /opt/flang/host/bin/flang-orig "${args[@]}"\n' > /opt/flang/host/bin/flang
           chmod +x /opt/flang/host/bin/flang
 
-      - name: Build packages
+      - name: Build packages (skip any that fail)
         shell: Rscript {0}
         run: |
           library(rwasm)
-          pkgs <- c("quadprog")
-          add_pkg(pkgs, repo_dir = "/github/workspace/repo")
+          repo <- "/github/workspace/repo"
+
+          pkgs <- c(
+            "quadprog",
+            "MLEcens",
+            "qs2",
+            "rootSolve",
+            "muhaz",
+            "deSolve",
+            "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
+            "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz"
+          )
+
+          ok <- character(0)
+          failed <- character(0)
+
+          # Build each package in isolation so one failure can't sink the rest.
+          for (p in pkgs) {
+            cat(sprintf("\n========== Building %s ==========\n", p))
+            success <- tryCatch({
+              add_pkg(p, repo_dir = repo, dependencies = TRUE)
+              TRUE
+            }, error = function(e) {
+              cat(sprintf("!! SKIPPING %s - build failed: %s\n", p, conditionMessage(e)))
+              FALSE
+            })
+            if (isTRUE(success)) ok <- c(ok, p) else failed <- c(failed, p)
+          }
+
+          # Write the PACKAGES index from whatever succeeded.
           tryCatch(
-            build("/github/workspace/repo"),
+            build(repo),
             error = function(e) {
-              bin <- list.files("/github/workspace/repo/bin", recursive = TRUE, pattern = "\\.tgz$")
-              if (length(bin) > 0) message("Build succeeded, ignoring post-build error: ", e$message)
+              bin <- list.files(file.path(repo, "bin"), recursive = TRUE, pattern = "\\.tgz$")
+              if (length(bin) > 0) message("Post-build error ignored (binaries present): ", conditionMessage(e))
               else stop(e)
             }
           )
+
+          built <- list.files(file.path(repo, "bin"), recursive = TRUE, pattern = "\\.tgz$")
+          cat("\n================ SUMMARY ================\n")
+          cat(sprintf("Requested OK (%d): %s\n", length(ok), paste(ok, collapse = ", ")))
+          cat(sprintf("Skipped (%d): %s\n", length(failed), paste(failed, collapse = ", ")))
+          cat(sprintf("Total .tgz in repo (incl. dependencies): %d\n", length(built)))
+
+          # Only fail the job if nothing at all built - otherwise deploy the partial repo.
+          if (length(built) == 0) stop("No packages built - nothing to deploy.")
 
       - uses: actions/upload-pages-artifact@v3
         with:
