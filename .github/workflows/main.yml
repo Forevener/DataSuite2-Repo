@@ -37,7 +37,6 @@ jobs:
           # we don't recompile the dependency closure the official repo already ships.
           pkgs <- c(
             "quadprog",
-            "MLEcens",
             "qs2",
             "rootSolve",
             "muhaz",
