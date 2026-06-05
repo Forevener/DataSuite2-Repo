@@ -1,0 +1,48 @@
+name: Build and deploy wasm R package repository
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/r-wasm/webr:main
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create flang wrapper to filter incompatible flags
+        run: |
+          cp /opt/flang/host/bin/flang /opt/flang/host/bin/flang-orig
+          printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    -fvisibility=*|-msse*|-mfpmath=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec /opt/flang/host/bin/flang-orig "${args[@]}"\n' > /opt/flang/host/bin/flang
+          chmod +x /opt/flang/host/bin/flang
+
+      - name: Build packages
+        shell: Rscript {0}
+        run: |
+          library(rwasm)
+          pkgs <- c("quadprog")
+          add_pkg(pkgs, repo_dir = "/github/workspace/repo")
+          tryCatch(
+            build("/github/workspace/repo"),
+            error = function(e) {
+              bin <- list.files("/github/workspace/repo/bin", recursive = TRUE, pattern = "\\.tgz$")
+              if (length(bin) > 0) message("Build succeeded, ignoring post-build error: ", e$message)
+              else stop(e)
+            }
+          )
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: /github/workspace/repo
+
+  deploy:
+    needs: build
+    permissions: { pages: write, id-token: write }
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
