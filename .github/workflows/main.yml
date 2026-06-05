@@ -3,14 +3,20 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - .github/workflows/build-wasm-repo.yml   # adjust to this file's name
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/r-wasm/webr:main
+    container: ghcr.io/r-wasm/webr:main   # consider pinning to a tag/digest
     steps:
-      - uses: actions/checkout@v4
-
       # Fortran packages (quadprog, rootSolve, muhaz, deSolve): LLVM flang chokes
       # on host-CPU flags R passes it. Strip the incompatible ones. Harmless for
       # C/C++/pure-R packages.
@@ -20,12 +26,15 @@ jobs:
           printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    -fvisibility=*|-msse*|-mfpmath=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec /opt/flang/host/bin/flang-orig "${args[@]}"\n' > /opt/flang/host/bin/flang
           chmod +x /opt/flang/host/bin/flang
 
-      - name: Build packages (skip any that fail)
+      - name: Build packages (only those missing upstream)
         shell: Rscript {0}
         run: |
           library(rwasm)
           repo <- "/github/workspace/repo"
 
+          # Packages we want hosted. webR resolves runtime dependencies from the
+          # official repo (repo.r-wasm.org) at install time, so dependencies = FALSE:
+          # we don't recompile the dependency closure the official repo already ships.
           pkgs <- c(
             "quadprog",
             "MLEcens",
@@ -37,20 +46,45 @@ jobs:
             "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz"
           )
 
-          ok <- character(0)
-          failed <- character(0)
+          # ---- What does the official webR repo already ship? -------------------
+          ver <- paste(R.version$major, sub("\\..*", "", R.version$minor), sep = ".")
+          contrib <- sprintf("https://repo.r-wasm.org/bin/emscripten/contrib/%s", ver)
+          upstream <- tryCatch(
+            rownames(available.packages(contriburl = contrib)),
+            error = function(e) {
+              message("Could not read official webR index; building everything: ",
+                      conditionMessage(e))
+              character(0)
+            }
+          )
+
+          is_url    <- function(ref) startsWith(ref, "url::")
+          # Package name from a url:: ref (e.g. ".../biclust_2.0.3.1.tar.gz" -> "biclust")
+          pkg_name  <- function(ref) if (is_url(ref))
+            sub("^.*/([A-Za-z0-9.]+)_[0-9].*$", "\\1", ref) else ref
+
+          ok <- skipped <- failed <- character(0)
 
           # Build each package in isolation so one failure can't sink the rest.
           for (p in pkgs) {
-            cat(sprintf("\n========== Building %s ==========\n", p))
+            name <- pkg_name(p)
+            # Pinned archive URLs always build (we want that exact version).
+            # Named CRAN refs are skipped when the official repo already has them —
+            # webR will fetch those at install time.
+            if (!is_url(p) && name %in% upstream) {
+              cat(sprintf("\n===== %s available upstream - skipping =====\n", name))
+              skipped <- c(skipped, name)
+              next
+            }
+            cat(sprintf("\n========== Building %s ==========\n", name))
             success <- tryCatch({
-              add_pkg(p, repo_dir = repo, dependencies = TRUE)
+              add_pkg(p, repo_dir = repo, dependencies = FALSE)
               TRUE
             }, error = function(e) {
-              cat(sprintf("!! SKIPPING %s - build failed: %s\n", p, conditionMessage(e)))
+              cat(sprintf("!! BUILD FAILED for %s: %s\n", name, conditionMessage(e)))
               FALSE
             })
-            if (isTRUE(success)) ok <- c(ok, p) else failed <- c(failed, p)
+            if (isTRUE(success)) ok <- c(ok, name) else failed <- c(failed, name)
           }
 
           # Write the PACKAGES index from whatever succeeded.
@@ -58,18 +92,26 @@ jobs:
             build(repo),
             error = function(e) {
               bin <- list.files(file.path(repo, "bin"), recursive = TRUE, pattern = "\\.tgz$")
-              if (length(bin) > 0) message("Post-build error ignored (binaries present): ", conditionMessage(e))
+              if (length(bin) > 0)
+                message("Post-build error ignored (binaries present): ", conditionMessage(e))
               else stop(e)
             }
           )
 
           built <- list.files(file.path(repo, "bin"), recursive = TRUE, pattern = "\\.tgz$")
           cat("\n================ SUMMARY ================\n")
-          cat(sprintf("Requested OK (%d): %s\n", length(ok), paste(ok, collapse = ", ")))
-          cat(sprintf("Skipped (%d): %s\n", length(failed), paste(failed, collapse = ", ")))
-          cat(sprintf("Total .tgz in repo (incl. dependencies): %d\n", length(built)))
+          cat(sprintf("Built (%d): %s\n", length(ok), paste(ok, collapse = ", ")))
+          cat(sprintf("Skipped, available upstream (%d): %s\n",
+                      length(skipped), paste(skipped, collapse = ", ")))
+          cat(sprintf("Total .tgz in repo: %d\n", length(built)))
 
-          # Only fail the job if nothing at all built - otherwise deploy the partial repo.
+          # Failed list, printed last and loud so it's easy to spot in the log.
+          if (length(failed)) {
+            cat("\n!!!!!!!!!!!!! FAILED PACKAGES !!!!!!!!!!!!!\n")
+            cat(sprintf("Failed (%d):\n", length(failed)))
+            cat(paste0("  - ", failed, collapse = "\n"), "\n")
+          }
+
           if (length(built) == 0) stop("No packages built - nothing to deploy.")
 
       - uses: actions/upload-pages-artifact@v3
