@@ -75,6 +75,7 @@ jobs:
           cran <- available.packages(repos = "https://cloud.r-project.org")
           hard <- c("Depends", "Imports", "LinkingTo")
 
+          ref_url  <- function(ref) sub("^url::", "", ref)
           is_local <- function(ref) startsWith(ref, "local::")
           is_url   <- function(ref) startsWith(ref, "url::") || is_local(ref)
           pkg_name <- function(ref) {
