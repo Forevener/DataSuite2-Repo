@@ -33,7 +33,7 @@ jobs:
           # uniroot.all is used. Its Fortran LSODA solvers use a COMMON block the
           # wasm backend can't link (webr#425), and useDynLib drags the unlinkable
           # .so in at load time. Strip the compiled code so the namespace loads.
-          rootsolve_shim <- function(
+          rootSolve_shim <- function(
               url = "https://cran.r-project.org/src/contrib/rootSolve_1.8.2.4.tar.gz") {
             tb  <- tempfile(fileext = ".tar.gz"); download.file(url, tb, quiet = TRUE)
             dir <- tempfile(); dir.create(dir); untar(tb, exdir = dir)
