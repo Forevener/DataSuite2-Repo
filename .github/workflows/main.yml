@@ -29,13 +29,31 @@ jobs:
       - name: Build packages and any hard deps missing upstream
         shell: Rscript {0}
         run: |
+          # DescTools -> Exact -> rootSolve, but only rootSolve's pure-R
+          # uniroot.all is used. Its Fortran LSODA solvers use a COMMON block the
+          # wasm backend can't link (webr#425), and useDynLib drags the unlinkable
+          # .so in at load time. Strip the compiled code so the namespace loads.
+          rootsolve_shim <- function(
+              url = "https://cran.r-project.org/src/contrib/rootSolve_1.8.2.4.tar.gz") {
+            tb  <- tempfile(fileext = ".tar.gz"); download.file(url, tb, quiet = TRUE)
+            dir <- tempfile(); dir.create(dir); untar(tb, exdir = dir)
+            pkg <- list.dirs(dir, recursive = FALSE)[1]
+            unlink(file.path(pkg, "src"), recursive = TRUE)              # no compiled code
+            ns  <- file.path(pkg, "NAMESPACE")
+            writeLines(grep("useDynLib", readLines(ns), value = TRUE, invert = TRUE), ns)
+            d   <- read.dcf(file.path(pkg, "DESCRIPTION"))
+            if ("NeedsCompilation" %in% colnames(d)) d[, "NeedsCompilation"] <- "no"
+            write.dcf(d, file.path(pkg, "DESCRIPTION"))
+            paste0("local::", pkg)                                       # build from patched source
+          }
+          
           library(rwasm)
           repo <- "/github/workspace/repo"
 
           pkgs <- c(
             "quadprog",
             "qs2",
-            "rootSolve",
+            rootSolve_shim(),
             "muhaz",
             "deSolve",
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
@@ -57,10 +75,13 @@ jobs:
           cran <- available.packages(repos = "https://cloud.r-project.org")
           hard <- c("Depends", "Imports", "LinkingTo")
 
-          is_url   <- function(ref) startsWith(ref, "url::")
-          ref_url  <- function(ref) sub("^url::", "", ref)
-          pkg_name <- function(ref) if (is_url(ref))
-            sub("^.*/([A-Za-z0-9.]+)_[0-9].*$", "\\1", ref) else ref
+          is_local <- function(ref) startsWith(ref, "local::")
+          is_url   <- function(ref) startsWith(ref, "url::") || is_local(ref)
+          pkg_name <- function(ref)
+            if (is_local(ref)) basename(sub("^local::", "", ref))
+            else if (startsWith(ref, "url::"))
+              sub("^.*/([A-Za-z0-9.]+)_[0-9].*$", "\\1", ref)
+            else ref
 
           # Direct hard deps of a url:: package, read straight from its DESCRIPTION.
           url_hard_deps <- function(url) {
