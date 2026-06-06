@@ -26,6 +26,15 @@ jobs:
           printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    -fvisibility=*|-msse*|-mfpmath=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec /opt/flang/host/bin/flang-orig "${args[@]}"\n' > /opt/flang/host/bin/flang
           chmod +x /opt/flang/host/bin/flang
 
+      - name: Upgrade rwasm to a fixed resolver (keeps the v0.6.0 SDK/ABI)
+        shell: Rscript {0}
+        run: |
+          install.packages(
+            "rwasm",
+            repos = c("https://r-wasm.r-universe.dev", "https://cloud.r-project.org")
+          )
+          cat("rwasm now at: ", as.character(packageVersion("rwasm")), "\n")
+
       - name: Build packages (only those missing upstream)
         shell: Rscript {0}
         run: |
