@@ -15,7 +15,7 @@ permissions: {}
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/r-wasm/webr:main   # consider pinning to a tag/digest
+    container: ghcr.io/r-wasm/webr:v0.6.0   # consider pinning to a tag/digest
     steps:
       # Fortran packages (quadprog, rootSolve, muhaz, deSolve): LLVM flang chokes
       # on host-CPU flags R passes it. Strip the incompatible ones. Harmless for
