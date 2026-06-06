@@ -77,11 +77,15 @@ jobs:
 
           is_local <- function(ref) startsWith(ref, "local::")
           is_url   <- function(ref) startsWith(ref, "url::") || is_local(ref)
-          pkg_name <- function(ref)
-            if (is_local(ref)) basename(sub("^local::", "", ref))
-            else if (startsWith(ref, "url::"))
+          pkg_name <- function(ref) {
+            if (is_local(ref)) {
+              basename(sub("^local::", "", ref))
+            } else if (startsWith(ref, "url::")) {
               sub("^.*/([A-Za-z0-9.]+)_[0-9].*$", "\\1", ref)
-            else ref
+            } else {
+              ref
+            }
+          }
 
           # Direct hard deps of a url:: package, read straight from its DESCRIPTION.
           url_hard_deps <- function(url) {
