@@ -26,15 +26,12 @@ jobs:
           printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    -fvisibility=*|-msse*|-mfpmath=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec /opt/flang/host/bin/flang-orig "${args[@]}"\n' > /opt/flang/host/bin/flang
           chmod +x /opt/flang/host/bin/flang
 
-      - name: Build packages (only those missing upstream)
+      - name: Build packages and any hard deps missing upstream
         shell: Rscript {0}
         run: |
           library(rwasm)
           repo <- "/github/workspace/repo"
 
-          # Packages we want hosted. webR resolves runtime dependencies from the
-          # official repo (repo.r-wasm.org) at install time, so dependencies = FALSE:
-          # we don't recompile the dependency closure the official repo already ships.
           pkgs <- c(
             "quadprog",
             "qs2",
@@ -45,35 +42,63 @@ jobs:
             "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz"
           )
 
-          # ---- What does the official webR repo already ship? -------------------
-          ver <- paste(R.version$major, sub("\\..*", "", R.version$minor), sep = ".")
+          # ---- What's already provided, and what's a hard dependency? ----------
+          ver     <- paste(R.version$major, sub("\\..*", "", R.version$minor), sep = ".")
           contrib <- sprintf("https://repo.r-wasm.org/bin/emscripten/contrib/%s", ver)
           upstream <- tryCatch(
             rownames(available.packages(contriburl = contrib)),
             error = function(e) {
-              message("Could not read official webR index; building everything: ",
-                      conditionMessage(e))
-              character(0)
+              message("Could not read official webR index: ", conditionMessage(e)); character(0)
             }
           )
+          # base + recommended ship inside webR, so they never need building.
+          bundled <- rownames(installed.packages(priority = c("base", "recommended")))
+          # CRAN source metadata, used to resolve dependency closures.
+          cran <- available.packages(repos = "https://cloud.r-project.org")
+          hard <- c("Depends", "Imports", "LinkingTo")
 
-          is_url    <- function(ref) startsWith(ref, "url::")
-          # Package name from a url:: ref (e.g. ".../biclust_2.0.3.1.tar.gz" -> "biclust")
-          pkg_name  <- function(ref) if (is_url(ref))
+          is_url   <- function(ref) startsWith(ref, "url::")
+          ref_url  <- function(ref) sub("^url::", "", ref)
+          pkg_name <- function(ref) if (is_url(ref))
             sub("^.*/([A-Za-z0-9.]+)_[0-9].*$", "\\1", ref) else ref
 
-          ok <- skipped <- failed <- character(0)
+          # Direct hard deps of a url:: package, read straight from its DESCRIPTION.
+          url_hard_deps <- function(url) {
+            tmp <- tempfile(fileext = ".tar.gz")
+            download.file(url, tmp, quiet = TRUE)
+            inside <- untar(tmp, list = TRUE)
+            dpath  <- grep("(^|/)DESCRIPTION$", inside, value = TRUE)[1]
+            untar(tmp, files = dpath, exdir = dirname(tmp))
+            dcf  <- read.dcf(file.path(dirname(tmp), dpath))
+            flds <- intersect(colnames(dcf), hard)
+            if (!length(flds)) return(character(0))
+            nm <- trimws(gsub("\\(.*?\\)", "", strsplit(paste(dcf[1, flds], collapse = ","), "[,\n]")[[1]]))
+            setdiff(nm[nzchar(nm)], "R")
+          }
 
-          # Build each package in isolation so one failure can't sink the rest.
-          for (p in pkgs) {
+          # ---- Recursive hard-dependency closure of everything requested -------
+          req_names <- vapply(pkgs, pkg_name, character(1))
+          seed <- unlist(lapply(pkgs, function(p)
+            if (is_url(p)) url_hard_deps(ref_url(p)) else p), use.names = FALSE)
+          seed <- unique(seed[seed %in% rownames(cran)])
+          closure <- unique(c(seed, unlist(
+            tools::package_dependencies(seed, db = cran, which = hard, recursive = TRUE),
+            use.names = FALSE)))
+
+          # Hard deps that nobody provides yet -> build and host them ourselves.
+          missing_deps <- setdiff(closure, c(upstream, bundled, req_names))
+          if (length(missing_deps))
+            cat(sprintf("Hard deps missing upstream, building too: %s\n",
+                        paste(missing_deps, collapse = ", ")))
+
+          build_set <- c(pkgs, missing_deps)
+
+          ok <- skipped <- failed <- character(0)
+          for (p in build_set) {
             name <- pkg_name(p)
-            # Pinned archive URLs always build (we want that exact version).
-            # Named CRAN refs are skipped when the official repo already has them —
-            # webR will fetch those at install time.
             if (!is_url(p) && name %in% upstream) {
               cat(sprintf("\n===== %s available upstream - skipping =====\n", name))
-              skipped <- c(skipped, name)
-              next
+              skipped <- c(skipped, name); next
             }
             cat(sprintf("\n========== Building %s ==========\n", name))
             success <- tryCatch({
@@ -86,7 +111,6 @@ jobs:
             if (isTRUE(success)) ok <- c(ok, name) else failed <- c(failed, name)
           }
 
-          # Write the PACKAGES index from whatever succeeded.
           tryCatch(
             build(repo),
             error = function(e) {
@@ -103,14 +127,11 @@ jobs:
           cat(sprintf("Skipped, available upstream (%d): %s\n",
                       length(skipped), paste(skipped, collapse = ", ")))
           cat(sprintf("Total .tgz in repo: %d\n", length(built)))
-
-          # Failed list, printed last and loud so it's easy to spot in the log.
           if (length(failed)) {
             cat("\n!!!!!!!!!!!!! FAILED PACKAGES !!!!!!!!!!!!!\n")
             cat(sprintf("Failed (%d):\n", length(failed)))
             cat(paste0("  - ", failed, collapse = "\n"), "\n")
           }
-
           if (length(built) == 0) stop("No packages built - nothing to deploy.")
 
       - uses: actions/upload-pages-artifact@v3
