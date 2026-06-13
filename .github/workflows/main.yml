@@ -47,6 +47,167 @@ jobs:
             paste0("local::", pkg)                                       # build from patched source
           }
           
+          # brunnermunzel implements its Brunner-Munzel test (including the
+          # permutation variant) in Fortran. webR's LLVM flang-rt aborts on the
+          # package's runtime array constructors -- e.g. `xy = (/x, y/)` -- with
+          # RUNTIME_CHECK(to.rank() == 1) in array-constructor.cpp, so even the
+          # asymptotic test (perm = FALSE) crashes. Rewrite every runtime array
+          # constructor, the vector-subscript scatter in rank(), and the
+          # whole-array assignments into equivalent explicit DO loops
+          # (numerically identical). Compile-time `parameter` constructors and
+          # contiguous section arguments are left untouched.
+          brunnermunzel_shim <- function(
+              url = "https://cran.r-project.org/src/contrib/brunnermunzel_2.0.tar.gz") {
+            tb  <- tempfile(fileext = ".tar.gz"); download.file(url, tb, quiet = TRUE)
+            dir <- tempfile(); dir.create(dir); untar(tb, exdir = dir)
+            pkg <- list.dirs(dir, recursive = FALSE)[1]
+
+            E <- function(pattern, ...) list(pattern = pattern, repl = c(...))
+
+            # Replace each line matching a Perl regex (anchored on the statement,
+            # tolerant of indentation and trailing comments) with replacement
+            # lines. Errors loudly if a pattern is gone, so an upstream source
+            # change can't silently reintroduce an array constructor.
+            patch <- function(file, edits) {
+              path  <- file.path(pkg, "src", file)
+              lines <- readLines(path)
+              for (e in edits) {
+                idx <- grep(e$pattern, lines, perl = TRUE)
+                if (length(idx) == 0L)
+                  stop(sprintf("brunnermunzel patch: %s: missing pattern: %s",
+                               file, e$pattern))
+                for (i in rev(idx)) {
+                  before <- if (i > 1L) lines[seq_len(i - 1L)] else character(0)
+                  after  <- if (i < length(lines)) lines[(i + 1L):length(lines)] else character(0)
+                  lines  <- c(before, e$repl, after)
+                }
+              }
+              writeLines(lines, path)
+            }
+
+            patch("rank.f", list(
+              E("^\\s*integer i,j\\s*$",
+                "      integer i,j,k"),
+              E("^\\s*rk\\(idx\\(i:j\\)\\)\\s*=",
+                "         do k = i, j",
+                "            rk(idx(k)) = (i + j) * 0.5",
+                "         enddo")
+            ))
+
+            patch("bm_test.f", list(
+              E("^\\s*double precision se\\s*$",
+                "      double precision se",
+                "      integer i"),
+              E("^\\s*xy\\s*=\\s*\\(/x, y/\\)",
+                "      do i = 1, nx",
+                "         xy(i) = x(i)",
+                "      enddo",
+                "      do i = 1, ny",
+                "         xy(nx+i) = y(i)",
+                "      enddo"),
+              E("^\\s*ci\\(1:2\\)\\s*=\\s*pst",
+                "         ci(1) = pst",
+                "         ci(2) = pst"),
+              E("^\\s*dx\\s*=\\s*\\(rkxy\\(1:nx\\)",
+                "      do i = 1, nx",
+                "         dx(i) = (rkxy(i) - rkx(i) - mx + (nx + 1) * 0.5)**2",
+                "      enddo"),
+              E("^\\s*dy\\s*=\\s*\\(rkxy\\(nx\\+1:nx\\+ny\\)",
+                "      do i = 1, ny",
+                "         dy(i) = (rkxy(nx+i) - rky(i) - my + (ny + 1) * 0.5)**2",
+                "      enddo"),
+              E("^\\s*lowertail\\s*=\\s*\\(/",
+                "      lowertail(1) = 0",
+                "      lowertail(2) = 1",
+                "      lowertail(3) = 0"),
+              E("^\\s*multi\\s*=\\s*\\(/",
+                "      multi(1) = 2.0",
+                "      multi(2) = 1.0",
+                "      multi(3) = 1.0"),
+              E("^\\s*ci\\s*=\\s*pst\\s*\\+\\s*Rf_qt",
+                "      ci(1) = pst - Rf_qt(alpha * 0.5, abs(df), 0) * se",
+                "      ci(2) = pst + Rf_qt(alpha * 0.5, abs(df), 0) * se")
+            ))
+
+            patch("calc_statistics.f", list(
+              E("^\\s*dx\\s*=\\s*\\(rkxy\\(1:nx\\)",
+                "      do i = 1, nx",
+                "         dx(i) = (rkxy(i) - rkx(i) - mx + const(1))**2",
+                "      enddo"),
+              E("^\\s*dy\\s*=\\s*\\(rkxy\\(nx\\+1:nx\\+ny\\)",
+                "      do i = 1, ny",
+                "         dy(i) = (rkxy(nx+i) - rky(i) - my + const(2))**2",
+                "      enddo")
+            ))
+
+            patch("divide_groups.f", list(
+              E("^\\s*integer i,ix,iy\\s*$",
+                "      integer i,ix,iy,k"),
+              E("^\\s*tmp\\(1:\\(nx\\+1\\)\\)\\s*=",
+                "      do k = 1, nx",
+                "         tmp(k) = idx(k)",
+                "      enddo",
+                "      tmp(nx+1) = -1"),
+              E("^\\s*xy\\(1:nx\\)\\s*=\\s*x\\(1:nx\\)",
+                "      do k = 1, nx",
+                "         xy(k) = x(k)",
+                "      enddo"),
+              E("^\\s*xy\\(\\(nx\\+1\\):\\(nx\\+ny\\)\\)\\s*=",
+                "      do k = 1, ny",
+                "         xy(nx+k) = y(k)",
+                "      enddo")
+            ))
+
+            patch("combination.f", list(
+              E("^\\s*integer i,bef\\(1:r\\),numx,key\\(1:r\\)\\s*$",
+                "      integer i,bef(1:r),numx,key(1:r),k"),
+              E("^\\s*bef\\(1:r\\)\\s*=",
+                "      do k = 1, r",
+                "         bef(k) = arr(k) - ini(k)",
+                "      enddo"),
+              E("^\\s*arr\\(1:r\\)\\s*=\\s*0\\s*$",
+                "      do k = 1, r",
+                "         arr(k) = 0",
+                "      enddo"),
+              E("^\\s*key\\(1:r\\)\\s*=\\s*0",
+                "      do k = 1, r",
+                "         key(k) = 0",
+                "      enddo"),
+              E("^\\s*arr\\(1:r\\)\\s*=\\s*arr\\(1:r\\)",
+                "      do k = 1, r",
+                "         arr(k) = arr(k) + ini(k)",
+                "      enddo")
+            ))
+
+            patch("bm_permutation_stat.f", list(
+              E("^\\s*integer::nx,ny,i,j\\s*$",
+                "      integer::nx,ny,i,j,k"),
+              E("^\\s*idx\\(1:r\\)\\s*=\\s*ini\\(1:r\\)",
+                "      do k = 1, r",
+                "         idx(k) = ini(k)",
+                "      enddo")
+            ))
+
+            patch("bm_permutation_test.f", list(
+              E("^\\s*integer::i,count\\s*$",
+                "      integer::i,count,k"),
+              E("^\\s*dat2\\(1:n\\)\\s*=\\s*dat\\(1:n\\)",
+                "      do k = 1, n",
+                "         dat2(k) = dat(k)",
+                "      enddo"),
+              E("^\\s*statistics\\(1:n_nCr\\)\\s*=\\s*abs",
+                "         do k = 1, n_nCr",
+                "            statistics(k) = abs(statistics(k))",
+                "         enddo"),
+              E("^\\s*statistics\\(1:n_nCr\\)\\s*=\\s*-statistics",
+                "         do k = 1, n_nCr",
+                "            statistics(k) = -statistics(k)",
+                "         enddo")
+            ))
+
+            paste0("local::", pkg)
+          }
+
           library(rwasm)
           repo <- "/github/workspace/repo"
 
@@ -54,6 +215,7 @@ jobs:
             "quadprog",
             "qs2",
             rootSolve_shim(),
+            brunnermunzel_shim(),
             "muhaz",
             "deSolve",
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
