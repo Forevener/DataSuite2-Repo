@@ -216,6 +216,7 @@ jobs:
             "qs2",
             rootSolve_shim(),
             brunnermunzel_shim(),
+            "nanonext",
             "muhaz",
             "deSolve",
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
