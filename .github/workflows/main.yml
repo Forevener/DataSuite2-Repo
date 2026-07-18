@@ -208,6 +208,88 @@ jobs:
             paste0("local::", pkg)
           }
 
+          # CSDP (bundled in Rcsdp, needed by psych::fa fm = "minrank") calls
+          # BLAS/LAPACK the pre-FC_LEN_T way: no hidden character-length args.
+          # Native ABIs tolerate the mismatch, but wasm-ld enforces exact
+          # signatures against webR's flang-built libRblas/libRlapack and
+          # refuses to link (dgemm_ 13 args vs 15, etc.) -- why the package is
+          # absent from every wasm farm. Rename the five affected symbols
+          # inside the Csdp sub-build and forward them through C shims that
+          # append the hidden lengths via FCONE.
+          Rcsdp_shim <- function(
+              url = "https://cran.r-project.org/src/contrib/Rcsdp_0.1.57.6.tar.gz") {
+            tb  <- tempfile(fileext = ".tar.gz"); download.file(url, tb, quiet = TRUE)
+            dir <- tempfile(); dir.create(dir); untar(tb, exdir = dir)
+            pkg <- list.dirs(dir, recursive = FALSE)[1]
+
+            syms <- c("dgemm_", "dgemv_", "dpotrf_", "dpotrs_", "dtrtri_")
+
+            # Errors loudly if an upstream update changes how Csdp spells a
+            # call, so the rename can't silently stop matching.
+            src <- unlist(lapply(
+              list.files(file.path(pkg, "src", "Csdp", "lib"),
+                         pattern = "\\.c$", full.names = TRUE), readLines))
+            for (s in syms)
+              if (!any(grepl(s, src, fixed = TRUE)))
+                stop("Rcsdp patch: no reference to ", s, " in Csdp/lib sources")
+
+            # Rename only in the sub-make CFLAGS: blaswrap.c below must keep
+            # the real names, or its own F77_CALL forwards would rename
+            # themselves into infinite recursion.
+            mv <- file.path(pkg, "src", "Makevars.in")
+            lines <- readLines(mv)
+            hit <- grepl("-DNOSHORTS", lines, fixed = TRUE)
+            if (sum(hit) != 1L)
+              stop("Rcsdp patch: expected one -DNOSHORTS line in src/Makevars.in")
+            renames <- paste0("-D", syms, "=csdp_", syms, collapse = " ")
+            lines[hit] <- sub("-DNOSHORTS", paste("-DNOSHORTS", renames),
+                              lines[hit], fixed = TRUE)
+            writeLines(lines, mv)
+
+            writeLines(c(
+              "#define USE_FC_LEN_T",
+              "#include <R_ext/BLAS.h>",
+              "#include <R_ext/Lapack.h>",
+              "#ifndef FCONE",
+              "# define FCONE",
+              "#endif",
+              "",
+              "void csdp_dgemm_(char *transa, char *transb, int *m, int *n, int *k,",
+              "                 double *alpha, double *a, int *lda, double *b, int *ldb,",
+              "                 double *beta, double *c, int *ldc)",
+              "{",
+              "    F77_CALL(dgemm)(transa, transb, m, n, k, alpha, a, lda,",
+              "                    b, ldb, beta, c, ldc FCONE FCONE);",
+              "}",
+              "",
+              "void csdp_dgemv_(char *trans, int *m, int *n, double *alpha, double *a,",
+              "                 int *lda, double *x, int *incx, double *beta, double *y,",
+              "                 int *incy)",
+              "{",
+              "    F77_CALL(dgemv)(trans, m, n, alpha, a, lda, x, incx, beta, y, incy FCONE);",
+              "}",
+              "",
+              "void csdp_dpotrf_(char *uplo, int *n, double *a, int *lda, int *info)",
+              "{",
+              "    F77_CALL(dpotrf)(uplo, n, a, lda, info FCONE);",
+              "}",
+              "",
+              "void csdp_dpotrs_(char *uplo, int *n, int *nrhs, double *a, int *lda,",
+              "                  double *b, int *ldb, int *info)",
+              "{",
+              "    F77_CALL(dpotrs)(uplo, n, nrhs, a, lda, b, ldb, info FCONE);",
+              "}",
+              "",
+              "void csdp_dtrtri_(char *uplo, char *diag, int *n, double *a, int *lda,",
+              "                  int *info)",
+              "{",
+              "    F77_CALL(dtrtri)(uplo, diag, n, a, lda, info FCONE FCONE);",
+              "}"
+            ), file.path(pkg, "src", "blaswrap.c"))
+
+            paste0("local::", pkg)
+          }
+
           library(rwasm)
           repo <- "/github/workspace/repo"
 
@@ -219,9 +301,7 @@ jobs:
             "nanonext",
             "muhaz",
             "deSolve",
-            # CSDP SDP solver for psych::fa(fm = "minrank"); on CRAN but absent
-            # from every wasm farm (repo.r-wasm.org, cran.r-universe.dev).
-            "Rcsdp",
+            Rcsdp_shim(),
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
             "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz"
           )
