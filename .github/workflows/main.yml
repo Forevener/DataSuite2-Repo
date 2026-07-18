@@ -219,6 +219,9 @@ jobs:
             "nanonext",
             "muhaz",
             "deSolve",
+            # CSDP SDP solver for psych::fa(fm = "minrank"); on CRAN but absent
+            # from every wasm farm (repo.r-wasm.org, cran.r-universe.dev).
+            "Rcsdp",
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
             "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz"
           )
