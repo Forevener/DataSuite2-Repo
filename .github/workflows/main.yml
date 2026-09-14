@@ -301,6 +301,7 @@ jobs:
             "nanonext",
             "muhaz",
             "deSolve",
+            "mclust",
             Rcsdp_shim(),
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
             "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz"
