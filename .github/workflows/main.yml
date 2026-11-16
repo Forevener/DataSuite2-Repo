@@ -550,7 +550,10 @@ jobs:
 
           pkgs <- c(
             "quadprog",
-            "qs2",
+            # Pinned: qs2 >= 0.4.0 needs RcppParallel >= 6.1.1, and every wasm
+            # repo stops at 5.1.11-2, so the built binary fails to load. 0.2.2
+            # takes any RcppParallel. Unpin once a newer one is in r-wasm.
+            "url::https://cran.r-project.org/src/contrib/Archive/qs2/qs2_0.2.2.tar.gz",
             rootSolve_shim(),
             brunnermunzel_shim(),
             "nanonext",
@@ -569,14 +572,18 @@ jobs:
           # ---- What's already provided, and what's a hard dependency? ----------
           ver     <- paste(R.version$major, sub("\\..*", "", R.version$minor), sep = ".")
           contrib <- sprintf("https://repo.r-wasm.org/bin/emscripten/contrib/%s", ver)
-          upstream <- tryCatch(
-            rownames(available.packages(contriburl = contrib)),
+          # The indexes are kept whole (not only their names): the dependency
+          # check after the build reads their versions.
+          upstream_db <- tryCatch(
+            available.packages(contriburl = contrib),
             error = function(e) {
-              message("Could not read official webR index: ", conditionMessage(e)); character(0)
+              message("Could not read official webR index: ", conditionMessage(e)); NULL
             }
           )
+          upstream <- if (is.null(upstream_db)) character(0) else rownames(upstream_db)
           # base + recommended ship inside webR, so they never need building.
-          bundled <- rownames(installed.packages(priority = c("base", "recommended")))
+          bundled_db <- installed.packages(priority = c("base", "recommended"))
+          bundled    <- rownames(bundled_db)
           # CRAN source metadata, used to resolve dependency closures.
           cran <- available.packages(repos = "https://cloud.r-project.org")
           hard <- c("Depends", "Imports", "LinkingTo")
@@ -653,39 +660,109 @@ jobs:
             if (isTRUE(success)) ok <- c(ok, name) else failed <- c(failed, name)
           }
 
-          # ---- Keep the live binary of every package that failed ------------
+          # ---- Keep the live binary of every package that didn't make it ----
           # Each deploy replaces the whole site, so a package that failed here
           # would vanish from the repo. Carry its currently served binary over
           # instead: only what built is replaced. A package the live repo has
-          # never served stays missing.
+          # never served stays missing. Called twice: for the failed builds,
+          # then for the built packages the dependency check below rejects.
           live_repo <- Sys.getenv("LIVE_REPO")
           bin_rel   <- file.path("bin", "emscripten", "contrib", ver)
           bin_dir   <- file.path(repo, bin_rel)
+          dir.create(bin_dir, recursive = TRUE, showWarnings = FALSE)
           kept <- lost <- character(0)
-          if (length(failed)) {
-            dir.create(bin_dir, recursive = TRUE, showWarnings = FALSE)
-            live <- tryCatch(
-              available.packages(contriburl = paste(live_repo, bin_rel, sep = "/"),
-                                 filters = list()),
-              error = function(e) {
-                message("Could not read the live index: ", conditionMessage(e)); NULL
-              }
-            )
-            for (name in failed) {
-              if (is.null(live) || !name %in% rownames(live)) { lost <- c(lost, name); next }
+          live <- NULL; live_read <- FALSE
+          restore_live <- function(names) {
+            if (length(names) && !live_read) {
+              live <<- tryCatch(
+                available.packages(contriburl = paste(live_repo, bin_rel, sep = "/"),
+                                   filters = list()),
+                error = function(e) {
+                  message("Could not read the live index: ", conditionMessage(e)); NULL
+                }
+              )
+              live_read <<- TRUE
+            }
+            for (name in names) {
+              if (is.null(live) || !name %in% rownames(live)) { lost <<- c(lost, name); next }
               file <- sprintf("%s_%s.tgz", name, live[name, "Version"])
               got <- tryCatch({
                 download.file(paste(live_repo, bin_rel, file, sep = "/"),
                               file.path(bin_dir, file), mode = "wb", quiet = TRUE)
                 TRUE
               }, error = function(e) FALSE)
-              if (got) kept <- c(kept, name) else lost <- c(lost, name)
+              if (got) kept <<- c(kept, name) else lost <<- c(lost, name)
             }
           }
 
+          restore_live(failed)
           # add_pkg() wrote PACKAGES for what built; rewrite it to take in the
           # carried-over binaries too.
           write_packages(repo)
+
+          # ---- Every built package's dependencies must be satisfiable -------
+          # The closure above is resolved by name, so a dependency upstream has
+          # in too old a version goes unnoticed until the package is loaded
+          # (qs2 0.4.0 needs RcppParallel >= 6.1.1; every wasm repo stops at
+          # 5.1.11-2). Check each package built this run, Depends and Imports
+          # (LinkingTo is build-time only), against the version that installs
+          # beside it: this repo's first, as webR's repos list orders them, then
+          # upstream's, then webR's bundled one. A package that fails is treated
+          # as a failed build: its new binary goes and the live one is kept.
+          index_db <- function(path) {
+            if (!file.exists(path)) return(NULL)
+            d <- read.dcf(path)
+            if (!nrow(d)) return(NULL)
+            rownames(d) <- d[, "Package"]
+            d
+          }
+          have_version <- function(dep, dbs) {
+            for (db in dbs)
+              if (!is.null(db) && dep %in% rownames(db)) return(db[dep, "Version"])
+            NA_character_
+          }
+          # "pkg (>= 1.2)" entries of a Depends/Imports field, as name/op/version.
+          parse_deps <- function(field) {
+            if (is.na(field) || !nzchar(trimws(field))) return(list())
+            entries <- trimws(strsplit(field, ",")[[1]])
+            lapply(entries[nzchar(entries)], function(s) {
+              m <- regmatches(s, regexec(
+                "^([A-Za-z0-9.]+)\\s*(?:\\(\\s*([<>=!]+)\\s*([^)]*?)\\s*\\))?$", s, perl = TRUE))[[1]]
+              if (!length(m)) return(list(name = s, op = NA, ver = NA))   # unparsable: report as unmet
+              list(name = m[2], op = if (nzchar(m[3])) m[3] else NA, ver = m[4])
+            })
+          }
+
+          ours_db <- index_db(file.path(bin_dir, "PACKAGES"))
+          unmet <- broken <- character(0)
+          for (name in intersect(ok, rownames(ours_db))) {
+            fields <- intersect(c("Depends", "Imports"), colnames(ours_db))
+            for (d in unlist(lapply(ours_db[name, fields], parse_deps), recursive = FALSE)) {
+              if (identical(d$name, "R")) next
+              have <- have_version(d$name, list(ours_db, upstream_db, bundled_db))
+              why <- if (is.na(have)) {
+                "no repo has it"
+              } else if (!is.na(d$op) &&
+                         !isTRUE(do.call(d$op, list(package_version(have), package_version(d$ver))))) {
+                sprintf("the repos have %s", have)
+              }
+              if (!is.null(why)) {
+                need <- if (is.na(d$op)) d$name else sprintf("%s %s %s", d$name, d$op, d$ver)
+                unmet  <- c(unmet, sprintf("%s %s needs %s - %s",
+                                           name, ours_db[name, "Version"], need, why))
+                broken <- union(broken, name)
+              }
+            }
+          }
+          if (length(broken)) {
+            for (name in broken)
+              unlink(c(Sys.glob(file.path(bin_dir, paste0(name, "_*.tgz"))),
+                       Sys.glob(file.path(repo, "src", "contrib", paste0(name, "_*.tar.gz")))))
+            ok     <- setdiff(ok, broken)
+            failed <- c(failed, broken)
+            restore_live(broken)
+            write_packages(repo)
+          }
 
           built <- list.files(file.path(repo, "bin"), recursive = TRUE, pattern = "\\.tgz$")
           cat("\n================ SUMMARY ================\n")
@@ -693,6 +770,11 @@ jobs:
           cat(sprintf("Skipped, available upstream (%d): %s\n",
                       length(skipped), paste(skipped, collapse = ", ")))
           cat(sprintf("Total .tgz in repo: %d\n", length(built)))
+          if (length(unmet)) {
+            cat("\n!!!!!!!!!!! UNSATISFIABLE DEPENDENCIES !!!!!!!!!!!\n")
+            cat("Built, but would not load - treated as failed below:\n")
+            cat(paste0("  - ", unmet, collapse = "\n"), "\n")
+          }
           if (length(failed)) {
             cat("\n!!!!!!!!!!!!! FAILED PACKAGES !!!!!!!!!!!!!\n")
             cat(sprintf("Failed (%d):\n", length(failed)))
