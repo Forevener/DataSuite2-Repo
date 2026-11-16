@@ -31,6 +31,24 @@ jobs:
           printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    -fvisibility=*|-msse*|-mfpmath=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec /opt/flang/host/bin/flang-orig "${args[@]}"\n' > /opt/flang/host/bin/flang
           chmod +x /opt/flang/host/bin/flang
 
+      # The v0.6.0 image lists rig's apt repository, now signed with a key the
+      # image doesn't have (NO_PUBKEY 6C439202CCDB438D). pak runs apt-get update
+      # for the system requirements of the host-side deps rwasm installs, so
+      # every package with deps failed. The build never uses rig: drop the source,
+      # then check apt is clean.
+      - name: Drop the rig apt source
+        shell: bash
+        run: |
+          for f in /etc/apt/sources.list.d/*; do
+            if [ -f "$f" ] && grep -q 'rig\.r-pkg\.org' "$f"; then
+              echo "Removing $f"; rm -f "$f"
+            fi
+          done
+          if [ -f /etc/apt/sources.list ]; then
+            sed -i '/rig\.r-pkg\.org/d' /etc/apt/sources.list
+          fi
+          apt-get update
+
       # The v0.6.0 image ships pkgdepends 0.9.1, whose resolver fails every
       # add_pkg() with "`nrow(out)` must equal `1`" (r-lib/pkgdepends#462).
       # webR's own image pins this tag, but only after v0.6.0 was cut. Installed
