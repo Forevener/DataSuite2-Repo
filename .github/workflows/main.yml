@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     container: ghcr.io/r-wasm/webr:main
     steps:
-      # Fortran packages (quadprog, rootSolve, muhaz, deSolve, mclust): LLVM flang
+      # Fortran packages (quadprog, rootSolve, muhaz, deSolve, mclust, splancs, earth): LLVM flang
       # chokes on host-CPU flags R passes it. Strip the incompatible ones. Harmless for
       # C/C++/pure-R packages.
       - name: Create flang wrapper to filter incompatible flags
@@ -107,6 +107,20 @@ jobs:
               "      DOUBLE PRECISION hpilot(1000)",
               "      COMMON /hazpil/ hpilot",
               "      DATA hpilot /1000*0.0D0/",
+              "      END"
+            ))
+          }
+
+          # splancs (needed by cassowaryr -> tourr): mse2d() and khat() share
+          # /anu/ -- hcell, h(1000), aval(1000) double under the routines'
+          # IMPLICIT DOUBLE PRECISION (A-H,O-Z), ncell integer.
+          splancs_shim <- function(
+              url = "https://cran.r-project.org/src/contrib/splancs_2.01-45.tar.gz") {
+            common_block_shim("splancs", url, "twodimmse.f", "ANU", c(
+              "      BLOCK DATA DSANU",
+              "      IMPLICIT DOUBLE PRECISION (A-H,O-Z)",
+              "      COMMON /anu/ hcell,h(1000),aval(1000),ncell",
+              "      DATA hcell, ncell /0.0D0, 0/",
               "      END"
             ))
           }
@@ -446,8 +460,14 @@ jobs:
             deSolve_shim(),
             mclust_shim(),
             Rcsdp_shim(),
+            splancs_shim(),
+            # MARS, needed by pre (RuleFit). C plus LINPACK-style Fortran
+            # (leaps.f), no COMMON blocks or array constructors.
+            "earth",
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
-            "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz"
+            "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz",
+            # CHAID is R-Forge only (never on CRAN); pure R, Depends: partykit.
+            "url::https://download.r-forge.r-project.org/src/contrib/CHAID_0.1-2.tar.gz"
           )
 
           # ---- What's already provided, and what's a hard dependency? ----------
