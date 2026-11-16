@@ -15,7 +15,12 @@ permissions: {}
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/r-wasm/webr:main
+    # Pinned to the webR the app runs (0.6.0): binaries must match the runtime's
+    # ABI, and the floating `main` tag swaps toolchains under us -- its Nov 2026
+    # republish broke the Fortran links of deSolve and splancs (wasm-ld:
+    # "section symbols must have local binding" / "malformed uleb128" while
+    # parsing an object). Bump together with the app.
+    container: ghcr.io/r-wasm/webr:v0.6.0
     steps:
       # Fortran packages (quadprog, rootSolve, muhaz, deSolve, mclust, splancs, earth): LLVM flang
       # chokes on host-CPU flags R passes it. Strip the incompatible ones. Harmless for
@@ -109,6 +114,31 @@ jobs:
               "      DATA hpilot /1000*0.0D0/",
               "      END"
             ))
+          }
+
+          # earth (MARS, needed by pre) declares four Fortran subroutines in
+          # earth.c as returning int. Native linkers ignore the return type;
+          # wasm-ld refuses daxpy_ against webR's libRblas ("function
+          # signature mismatch ... -> i32 in earth.o, -> void in libRblas.so"),
+          # and the three LINPACK ones from libR would mismatch at dyn.load.
+          # No call site uses a return value, so declare them void.
+          earth_shim <- function(
+              url = "https://cran.r-project.org/src/contrib/earth_5.3.6.tar.gz") {
+            tb  <- tempfile(fileext = ".tar.gz"); download.file(url, tb, quiet = TRUE)
+            dir <- tempfile(); dir.create(dir); untar(tb, exdir = dir)
+            pkg <- list.dirs(dir, recursive = FALSE)[1]
+
+            path  <- file.path(pkg, "src", "earth.c")
+            lines <- readLines(path)
+            pat   <- "^(extern _C_ )int( (dqrdc2|dtrsl|dqrsl|daxpy)_\\()"
+            hit   <- grepl(pat, lines, perl = TRUE)
+            # Fails loudly if upstream fixes or rewrites the declarations.
+            if (sum(hit) != 4L)
+              stop(sprintf("earth patch: expected 4 int-returning declarations, found %d", sum(hit)))
+            lines[hit] <- sub(pat, "\\1void\\2", lines[hit], perl = TRUE)
+            writeLines(lines, path)
+
+            paste0("local::", pkg)
           }
 
           # splancs (needed by cassowaryr -> tourr): mse2d() and khat() share
@@ -461,9 +491,7 @@ jobs:
             mclust_shim(),
             Rcsdp_shim(),
             splancs_shim(),
-            # MARS, needed by pre (RuleFit). C plus LINPACK-style Fortran
-            # (leaps.f), no COMMON blocks or array constructors.
-            "earth",
+            earth_shim(),
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
             "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz",
             # CHAID is R-Forge only (never on CRAN); pure R, Depends: partykit.
