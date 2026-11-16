@@ -113,7 +113,9 @@ jobs:
             # Fail loudly if upstream renamed a block or started initialising one
             # itself -- a second initialisation of the same block is a compile
             # error, a missing one is the load failure coming back.
-            src <- unlist(lapply(list.files(file.path(pkg, "src"), pattern = "\\.[fF](90|95)?$",
+            # Include files too: a block can live only in one (splancs' bounds.h).
+            src <- unlist(lapply(list.files(file.path(pkg, "src"),
+                                            pattern = "\\.([fF](90|95)?|h|inc)$",
                                             full.names = TRUE), readLines))
             code <- src[!grepl("^[cC*!]", src)]
             for (b in blocks)
@@ -158,6 +160,12 @@ jobs:
           # signature mismatch ... -> i32 in earth.o, -> void in libRblas.so"),
           # and the three LINPACK ones from libR would mismatch at dyn.load.
           # No call site uses a return value, so declare them void.
+          # Second fix: earth.fit.R passes `NAOK = TRUE` to .Call("ForwardPassR"),
+          # but .Call has no NAOK formal, so it arrives as a 31st argument --
+          # registered as 31 in rentries.c, defined with 30 in earth.c. Native
+          # calls drop the extra argument; wasm traps ("function signature
+          # mismatch") on the first earth() fit. The C code never saw it, so drop
+          # it and register 30.
           earth_shim <- function(
               url = "https://cran.r-project.org/src/contrib/earth_5.3.6.tar.gz") {
             tb  <- tempfile(fileext = ".tar.gz"); download.file(url, tb, quiet = TRUE)
@@ -174,19 +182,43 @@ jobs:
             lines[hit] <- sub(pat, "\\1void\\2", lines[hit], perl = TRUE)
             writeLines(lines, path)
 
+            # Exactly one line to drop and one count to change, or stop.
+            replace_once <- function(file, pattern, replacement) {
+              lines <- readLines(file)
+              hit   <- grepl(pattern, lines, perl = TRUE)
+              if (sum(hit) != 1L)
+                stop(sprintf("earth patch: %s: expected 1 match of %s, found %d",
+                             basename(file), pattern, sum(hit)))
+              if (is.null(replacement)) lines <- lines[!hit]
+              else lines[hit] <- sub(pattern, replacement, lines[hit], perl = TRUE)
+              writeLines(lines, file)
+            }
+            replace_once(file.path(pkg, "R", "earth.fit.R"), "^\\s*NAOK\\s*=\\s*TRUE,", NULL)
+            replace_once(file.path(pkg, "src", "rentries.c"),
+                         "(\\{\"ForwardPassR\",\\s*\\(DL_FUNC\\)&ForwardPassR,\\s*)31\\}", "\\130}")
+
             paste0("local::", pkg)
           }
 
-          # splancs (needed by cassowaryr -> tourr): mse2d() and khat() share
-          # /anu/ -- hcell, h(1000), aval(1000) double under the routines'
-          # IMPLICIT DOUBLE PRECISION (A-H,O-Z), ncell integer.
+          # splancs (needed by cassowaryr -> tourr), two blocks:
+          # - /anu/, shared by mse2d() and khat(): hcell, h(1000), aval(1000)
+          #   double under the routines' IMPLICIT DOUBLE PRECISION (A-H,O-Z),
+          #   ncell integer.
+          # - /bounds/, declared in bounds.h, which the polygon routines
+          #   include: area double, iconvx integer.
           splancs_shim <- function(
               url = "https://cran.r-project.org/src/contrib/splancs_2.01-45.tar.gz") {
-            common_block_shim("splancs", url, "twodimmse.f", "ANU", c(
+            common_block_shim("splancs", url, "twodimmse.f", c("ANU", "BOUNDS"), c(
               "      BLOCK DATA DSANU",
               "      IMPLICIT DOUBLE PRECISION (A-H,O-Z)",
               "      COMMON /anu/ hcell,h(1000),aval(1000),ncell",
               "      DATA hcell, ncell /0.0D0, 0/",
+              "      END",
+              "      BLOCK DATA DSBNDS",
+              "      DOUBLE PRECISION area",
+              "      INTEGER iconvx",
+              "      COMMON /bounds/ area,iconvx",
+              "      DATA area, iconvx /0.0D0, 0/",
               "      END"
             ))
           }
