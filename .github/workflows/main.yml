@@ -31,8 +31,26 @@ jobs:
           printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    -fvisibility=*|-msse*|-mfpmath=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec /opt/flang/host/bin/flang-orig "${args[@]}"\n' > /opt/flang/host/bin/flang
           chmod +x /opt/flang/host/bin/flang
 
+      # The v0.6.0 image ships pkgdepends 0.9.1, whose resolver fails every
+      # add_pkg() with "`nrow(out)` must equal `1`" (r-lib/pkgdepends#462).
+      # webR's own image pins this tag, but only after v0.6.0 was cut. Installed
+      # from the tag's tarball so pak's resolver never runs. Drop this step once
+      # the pinned image carries a fixed pkgdepends.
+      - name: Pin pkgdepends to v0.9.0-patched
+        shell: Rscript {0}
+        run: |
+          install.packages(
+            "https://github.com/r-lib/pkgdepends/archive/refs/tags/v0.9.0-patched.tar.gz",
+            repos = NULL, type = "source", lib = .Library)
+          if (packageVersion("pkgdepends", lib.loc = .Library) != "0.9.0")
+            stop("pkgdepends pin did not take: ", packageVersion("pkgdepends"))
+
       - name: Build packages and any hard deps missing upstream
         shell: Rscript {0}
+        env:
+          # This workflow's own Pages site, the one the deploy job replaces
+          # (repo.datasuite.site copies from it in a separate step).
+          LIVE_REPO: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
         run: |
           # DescTools -> Exact -> rootSolve. Its LSODES solver shares two ODEPACK
           # COMMON blocks (webr#425) - the same DLS001 and DLSS01 as deSolve, so
@@ -585,15 +603,39 @@ jobs:
             if (isTRUE(success)) ok <- c(ok, name) else failed <- c(failed, name)
           }
 
-          tryCatch(
-            build(repo),
-            error = function(e) {
-              bin <- list.files(file.path(repo, "bin"), recursive = TRUE, pattern = "\\.tgz$")
-              if (length(bin) > 0)
-                message("Post-build error ignored (binaries present): ", conditionMessage(e))
-              else stop(e)
+          # ---- Keep the live binary of every package that failed ------------
+          # Each deploy replaces the whole site, so a package that failed here
+          # would vanish from the repo. Carry its currently served binary over
+          # instead: only what built is replaced. A package the live repo has
+          # never served stays missing.
+          live_repo <- Sys.getenv("LIVE_REPO")
+          bin_rel   <- file.path("bin", "emscripten", "contrib", ver)
+          bin_dir   <- file.path(repo, bin_rel)
+          kept <- lost <- character(0)
+          if (length(failed)) {
+            dir.create(bin_dir, recursive = TRUE, showWarnings = FALSE)
+            live <- tryCatch(
+              available.packages(contriburl = paste(live_repo, bin_rel, sep = "/"),
+                                 filters = list()),
+              error = function(e) {
+                message("Could not read the live index: ", conditionMessage(e)); NULL
+              }
+            )
+            for (name in failed) {
+              if (is.null(live) || !name %in% rownames(live)) { lost <- c(lost, name); next }
+              file <- sprintf("%s_%s.tgz", name, live[name, "Version"])
+              got <- tryCatch({
+                download.file(paste(live_repo, bin_rel, file, sep = "/"),
+                              file.path(bin_dir, file), mode = "wb", quiet = TRUE)
+                TRUE
+              }, error = function(e) FALSE)
+              if (got) kept <- c(kept, name) else lost <- c(lost, name)
             }
-          )
+          }
+
+          # add_pkg() wrote PACKAGES for what built; rewrite it to take in the
+          # carried-over binaries too.
+          write_packages(repo)
 
           built <- list.files(file.path(repo, "bin"), recursive = TRUE, pattern = "\\.tgz$")
           cat("\n================ SUMMARY ================\n")
@@ -605,6 +647,9 @@ jobs:
             cat("\n!!!!!!!!!!!!! FAILED PACKAGES !!!!!!!!!!!!!\n")
             cat(sprintf("Failed (%d):\n", length(failed)))
             cat(paste0("  - ", failed, collapse = "\n"), "\n")
+            cat(sprintf("Kept the live binary (%d): %s\n", length(kept), paste(kept, collapse = ", ")))
+            cat(sprintf("Missing from the repo - not served live, or its download failed (%d): %s\n",
+                        length(lost), paste(lost, collapse = ", ")))
           }
           if (length(built) == 0) stop("No packages built - nothing to deploy.")
 
