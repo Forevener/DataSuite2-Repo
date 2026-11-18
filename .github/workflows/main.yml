@@ -545,6 +545,57 @@ jobs:
             paste0("local::", pkg)
           }
 
+          # MLEcens (imported by icenReg, whose bivariate NPMLE calls
+          # MLEcens::reduc) solves its linear systems with LAPACK's dspsv,
+          # declared by hand in util.c the pre-FC_LEN_T way: no hidden length
+          # for the `uplo` character argument. Rcsdp's mismatch again -- 8
+          # args against libRlapack's 9 -- and why r-universe's wasm build fails
+          # while every native one passes. Drop the hand-written prototype (its
+          # `char *` would conflict with R's `const char *`), take R's own from
+          # Lapack.h under USE_FC_LEN_T, and pass the length with FCONE.
+          MLEcens_shim <- function(
+              url = "https://cran.r-project.org/src/contrib/MLEcens_0.1-7.1.tar.gz") {
+            tb  <- tempfile(fileext = ".tar.gz"); download.file(url, tb, quiet = TRUE)
+            dir <- tempfile(); dir.create(dir); untar(tb, exdir = dir)
+            pkg <- list.dirs(dir, recursive = FALSE)[1]
+
+            # Fails loudly if upstream calls dspsv anywhere else, or rewrites
+            # the declaration or the call this edits.
+            srcs  <- list.files(file.path(pkg, "src"), pattern = "\\.[ch]$", full.names = TRUE)
+            users <- basename(srcs[vapply(srcs, function(f)
+              any(grepl("dspsv", readLines(f), fixed = TRUE)), logical(1))])
+            if (!identical(users, "util.c"))
+              stop("MLEcens patch: expected dspsv in util.c alone, found it in: ",
+                   paste(users, collapse = ", "))
+
+            path  <- file.path(pkg, "src", "util.c")
+            lines <- readLines(path)
+            decl  <- grep("^void F77_NAME\\s*\\(dspsv\\)\\s*\\(", lines, perl = TRUE)
+            call  <- grep("F77_CALL\\s*\\(dspsv\\)", lines, perl = TRUE)
+            if (length(decl) != 1L || length(call) != 1L)
+              stop(sprintf("MLEcens patch: expected 1 dspsv declaration and 1 call, found %d and %d",
+                           length(decl), length(call)))
+            if (!grepl("\\);\\s*$", lines[decl + 1L]))
+              stop("MLEcens patch: the dspsv declaration no longer spans two lines")
+            if (!grepl("&info);", lines[call + 1L], fixed = TRUE))
+              stop("MLEcens patch: the dspsv call no longer ends in `&info);` on its second line")
+
+            # The call sits below the declaration: edit it before the deletion
+            # shifts its index. USE_FC_LEN_T has to precede the first R header.
+            lines[call + 1L] <- sub("&info);", "&info FCONE);", lines[call + 1L], fixed = TRUE)
+            lines <- lines[-c(decl, decl + 1L)]
+            writeLines(c(
+              "#define USE_FC_LEN_T",
+              "#include <R_ext/Lapack.h>",
+              "#ifndef FCONE",
+              "# define FCONE",
+              "#endif",
+              lines
+            ), path)
+
+            paste0("local::", pkg)
+          }
+
           library(rwasm)
           repo <- "/github/workspace/repo"
 
@@ -563,6 +614,7 @@ jobs:
             Rcsdp_shim(),
             splancs_shim(),
             earth_shim(),
+            MLEcens_shim(),
             "url::https://cran.r-project.org/src/contrib/Archive/biclust/biclust_2.0.3.1.tar.gz",
             "url::https://cran.r-project.org/src/contrib/Archive/rtf/rtf_0.4-14.1.tar.gz",
             # CHAID is R-Forge only (never on CRAN); pure R, Depends: partykit.
